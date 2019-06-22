@@ -1,0 +1,7 @@
+Put your Puppy Slacko files here
+
+vmlinuz
+initrd.gz
+puppy_slacko_*.sfs
+
+is minimal files to run Puppy Slacko

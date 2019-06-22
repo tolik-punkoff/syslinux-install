@@ -1,0 +1,650 @@
+#!/bin/bash
+
+create_list() #$1 - dir, $2 - file mask
+{
+    FOUNDLST=""
+    for FLE in $(find $1 -maxdepth 1 -iname $2); do
+	if [ -n "$FLE" ]; then
+	    FOUNDLST="$FOUNDLST"`basename $FLE`"\n"
+	fi
+    done
+}
+
+check_file() #$1 - dir $2 - file mask $3 - -name/-iname 
+{
+    TMP_CTR=`find $1 -maxdepth 1 -type f $3 $2|wc -l`
+    if [ "$TMP_CTR" -ne 0 ];then
+	return 0
+    else
+	return 1
+    fi
+}
+
+ask_list() #$1 - list #$2 - header
+{
+    LIST_BUF=$1
+    LIST_BUF="$LIST_BUF""Cancel"
+    LIST_BUF=`echo -e "$LIST_BUF"|sed 's/\n/ /'`
+    
+    PS3=$2
+    
+    echo
+    select LIST_RET in $LIST_BUF; do
+	if [ -n "$LIST_RET" ];then
+	    break
+	fi
+    done
+}
+
+ask_string_nsp() #1-user ask string, #2-default variant
+{
+    read -r -p "$1 [$2]:"
+    
+    REPLY=`echo $REPLY | tr -d ' '|tr -d '\' 2>/dev/null`
+    
+    if [ -z "$REPLY" ]; then
+	if [ -n "$2" ]; then
+	    STR_RESULT=$2
+	fi
+    else
+	STR_RESULT=$REPLY
+    fi
+}
+
+ask_yn() #$1 - question
+{
+    echo -n "$1 [Y/N]: "
+    while [ 1 -eq 1 ];do
+	read -s -n1
+	
+	case "$REPLY" in
+	    [yY])
+		echo
+		return 0
+	    ;;
+	    [nN])
+		echo
+		return 1
+	    ;;
+	esac
+    done
+}
+
+
+is_active() #$1 - device (partition) name, e.g. /dev/sda1. 
+{
+    #Return 0 - partition active
+    #1 - not active or error
+    
+    ISACT_DEV=`echo "$1" | sed 's/[0-9]\+$//'`
+    ISACT_PART=`echo "$1"|sed 's/[^0-9]//g'`
+
+    ISACT_REC=$(dd if=$ISACT_DEV bs=1 count=16 status=none skip=$((0x1BE + 16 * ($ISACT_PART - 1) )) | od -t x1 -A n |awk '{print $1}')
+
+    if [ -z "$ISACT_REC" ];then #data error
+	return 1
+    fi
+    
+    if [ "$ISACT_REC" -eq 80 ];then 
+	return 0 # active
+    else
+	return 1 # not active
+    fi
+}
+
+tmp_mount() #$1 - device, $2 - fs, $3 - temp mount catalog
+{   
+    TMPMOUNT=0    
+
+    #check mountpoint
+    echo -n "Check mountpoint or mount $1..."
+    MOUNTPOINT=`mount|grep -w "$1"|awk '{print $3}'`
+    
+    if [ -z "$MOUNTPOINT" ]; then #not mount, mounting in temp mountpoint
+	mkdir -p "$3"
+	mount -t "$2" "$1" "$3"
+	if [ $? -ne 0 ]; then
+	    echo "$1 not mounted"
+	    return 1
+	fi
+	MOUNTPOINT="$3"
+	TMPMOUNT=1
+    fi
+    echo "OK"
+    return 0
+}
+
+tmp_umount()
+{
+    if [ $TMPMOUNT -eq 1 ]; then 
+	sleep 1
+	umount "$MOUNTPOINT"
+    fi
+}
+
+get_volinfo() #$1 - device data (blkid string)
+{
+    VOL=`echo "$1" |sed -n 's/\(.*:\).* TYPE=\"\([^\"]*\)\".*/\1\2/p'`
+    
+    VOLNAME=`echo "$VOL"|awk -F ":" '{print $1}'`
+    VOLFS=`echo "$VOL"|awk -F ":" '{print $2}'`
+}
+
+clear_tempfiles()
+{
+    echo -n "Clear temporary files..."
+    rm -rf "$MNT_PATH/slinstall"
+    rm "$MNT_PATH/$SYSLINUX_ARCH"
+    echo "Complete!"
+}
+
+add_menuitem()
+{
+    #1 - file, 2 - label 3 - menu label 4-kernel 5-initrd 6-append
+    M_FILE=$1
+    M_LABEL=$2
+    M_MNULABEL=$3
+    M_KERNEL=$4
+    M_INITRD=$5
+    M_APPEND=$6
+    
+    echo "LABEL $M_LABEL" >>$M_FILE
+    echo -e "\t menu label $M_MNULABEL" >>$M_FILE
+    echo -e "\t  kernel $M_KERNEL" >>$M_FILE
+    
+    
+    if [[ "$M_INITRD" != "---" ]];then
+	echo -e "\t  initrd $M_INITRD" >>$M_FILE
+    fi
+    if [[ "$M_APPEND" != "---" ]];then
+	echo -e "\t  append $M_APPEND" >>$M_FILE
+    fi
+    
+    
+    if [ "$IS_FIRSTITEM" -eq 1 ];then
+	echo -e "\t  timeout $DEF_TIMEOUT" >>$M_FILE
+	IS_FIRSTITEM=0
+    fi
+    
+    echo >>$M_FILE
+}
+
+get_slid() #$1 - device name (e.g. /dev/sda1)
+{
+    #get base name
+    T_BN=`basename $1`
+    
+    #get volume number
+    T_VOLNUM=`echo "$T_BN" | sed 's/^[a-z]*//'`
+    
+    #get disk name
+    T_DSKNAM=`echo "$1"|sed 's/[0-9]\+$//'`
+    if [ -z "$T_DSKNAM" ]; then
+	return 1 #error
+    fi
+    
+    #get MBR ID
+    T_MBRID=`hexdump -s 440 -n 4 -e '"0x%08x\n"' "$T_DSKNAM"`
+    
+    SL_ID="mbr:$T_MBRID $T_VOLNUM"
+
+}
+
+
+IS_FIRSTITEM=1
+SL_ID=""
+SYSLINUX_ARCH=""
+INSTALL_VOL=""
+MBR_DEV=""
+INSTALL_DIR=""
+MNT_PATH=""
+ACRONIS=""
+SLACKO=0
+CURDIR=`pwd`
+
+#search and select syslinux archive(s)
+echo -n "Search SYSLINUX archives..."
+create_list "$CURDIR/slinstall/" "*.tar.gz"
+if [ -n "$FOUNDLST" ];then
+    echo "OK"
+else
+    echo "NOT FOUND!"
+    exit 1
+fi
+ask_list "$FOUNDLST" "Select SYSLINUX archive to install (Cancel - exit): "
+if [ "$LIST_RET" == "Cancel" ]; then
+    echo "Cancelled, exit from script."
+    exit 2
+else
+    SYSLINUX_ARCH="$LIST_RET"
+    echo "Use archive: $SYSLINUX_ARCH"
+fi
+
+#search and select volume to install
+echo
+echo -n "Search Linux active volume(s)..."
+IFS=$'\n'
+VOLLIST=""
+for DEVDATA in $(blkid); do
+    get_volinfo "$DEVDATA"
+    if [ -n "$VOLFS" ]; then
+	if [[ "$VOLFS" == "ext2" || "$VOLFS" == "ext3" || "$VOLFS" == "ext4" || "$VOLFS" == "btrfs" ]];then
+	    is_active "$VOLNAME"
+	    if [ "$?" -eq 0 ];then
+		VOLLIST="$VOLLIST$VOLNAME\n"
+	    fi
+	fi
+    fi
+done
+if [ -n "$VOLLIST" ];then
+    echo "OK"
+else
+    echo "not found active linux volume."
+    exit 1
+fi
+
+ask_list "$VOLLIST" "Select volume to install (Cancel - exit): "
+if [ "$LIST_RET" == "Cancel" ]; then
+    echo "Cancelled, exit from script."
+    exit 2
+else
+    INSTALL_VOL="$LIST_RET"
+    echo "Use volume: $INSTALL_VOL"
+    MBR_DEV=`echo "$INSTALL_VOL"|sed 's/[0-9]\+$//'`
+    echo "MBR device: $MBR_DEV"
+fi
+
+#request for install directory
+echo
+while [ 1 -eq 1 ];do
+    ask_string_nsp "Select install directory (on $INSTALL_VOL)" "boot/syslinux"
+    DIR_CHK=`basename $STR_RESULT`
+    if [[ "$DIR_CHK" == "/" ]]; then
+	echo "Not install SYSLINUX in root directory on volume, select subdirectory!"
+    else
+	INSTALL_DIR=$STR_RESULT
+	break
+    fi
+done
+
+#Summary and install request
+echo
+echo "===== SUMMARY ====="
+echo
+echo "SYSLINUX archive: ........... $SYSLINUX_ARCH"
+echo "Install volume:  ...........  $INSTALL_VOL"
+echo "Device to write MBR: ........ $MBR_DEV"
+echo "Syslinux files directory: ... $INSTALL_DIR"
+echo
+echo "==================="
+echo
+ask_yn "Install SYSLINUX (main files) at this parameters?"
+if [ "$?" -eq 1 ]; then
+    echo "Cancelled, exit from script."
+    exit 2
+fi
+echo
+
+
+#mounting device and copy main files
+MNT_PATH="/mnt/"`basename "$INSTALL_VOL"`
+VOLDATA=`blkid "$INSTALL_VOL"`
+get_volinfo "$VOLDATA"
+tmp_mount "$INSTALL_VOL" "$VOLFS" "$MNT_PATH"
+if [ $? -ne 0 ]; then 
+    exit 1
+fi
+
+echo -n "Creating directory $MNT_PATH/$INSTALL_DIR..."
+mkdir -p "$MNT_PATH/$INSTALL_DIR"
+if [ $? -ne 0 ]; then
+    echo "Error"
+    tmp_umount
+    exit 1
+fi
+echo "OK"
+
+echo "Remove old installation directory."
+rm -rf "$MNT_PATH/slinstall"
+echo "Remove old modules."
+rm -rf "$MNT_PATH/$INSTALL_DIR/modules"
+
+echo -n "Copyng archive $SYSLINUX_ARCH to $MNT_PATH/$SYSLINUX_ARCH..."
+cp "$CURDIR/slinstall/$SYSLINUX_ARCH" "$MNT_PATH/$SYSLINUX_ARCH"
+if [ $? -ne 0 ]; then
+    echo "Error"
+    tmp_umount
+    exit 1
+fi
+echo "OK"
+
+echo -n "Unpacking archive..."
+tar xf "$MNT_PATH/$SYSLINUX_ARCH" -C "$MNT_PATH"
+if [ $? -ne 0 ]; then
+    tmp_umount
+    echo "Error"
+    exit 1
+fi
+echo "OK"
+
+echo -n "Copyng modules..."
+cp -r "$MNT_PATH/slinstall/modules" "$MNT_PATH/$INSTALL_DIR/"
+
+#Install SYSLINUX loader
+echo
+echo
+echo "Install SYSLINUX loader:"
+if [ -e "$MNT_PATH/$INSTALL_DIR/ldlinux.sys" ]; then
+    echo
+    echo "Loader file (ldlinux.sys) found in $MNT_PATH/$INSTALL_DIR:"
+    TMPLST="Reinstall\nContinue\n"
+    ask_list $TMPLST  "Select variant: Cancel - exit script "
+    case "$LIST_RET" in
+	"Cancel")
+	    echo "Cancelled, exit from script."
+	    exit 2
+	;;
+	"Reinstall")
+	    $MNT_PATH/slinstall/extlinux --install "$MNT_PATH/$INSTALL_DIR"
+	    if [ $? -ne 0 ]; then
+		tmp_umount
+		echo "Error"
+		exit 1
+	    fi
+	    echo "OK"
+	;;	
+    esac
+else
+    $MNT_PATH/slinstall/extlinux --install "$MNT_PATH/$INSTALL_DIR"
+    if [ $? -ne 0 ]; then
+	tmp_umount
+	echo "Error"
+	exit 1
+    fi
+    echo "OK"
+
+fi
+
+#MBR operations
+echo
+ask_yn "Install SYSLINUX MBR on $MBR_DEV? (No - skip MBR install)"
+if [ $? -eq 0 ]; then
+    echo -n "Backup old MBR..."
+    BAK_FILE=`date +%Y-%m-%d-%H-%M-%S`".old.mbr"
+    dd if="$MBR_DEV" of="$MNT_PATH/$INSTALL_DIR/$BAK_FILE" bs=440 count=1 >/dev/null 2>/dev/null
+    if [ $? -ne 0 ]; then
+	tmp_umount
+	echo "Error"
+	exit 1
+    fi
+    echo "OK. File $BAK_FILE"
+
+    echo -n "Installing..."
+    if [ -e "$MNT_PATH/slinstall/mbr/mbr.bin" ]; then
+	if [ -f "$MNT_PATH/slinstall/mbr/mbr.bin" ]; then
+	    dd if="$MNT_PATH/slinstall/mbr/mbr.bin" of="$MBR_DEV" bs=440 count=1 conv=notrunc >/dev/null 2>/dev/null
+	    if [ $? -ne 0 ]; then
+		tmp_umount
+		echo "Error"
+		exit 1
+	    else
+		echo "OK"
+	    fi
+	else
+	    tmp_umount
+	    echo "Error: mbr.bin not a file!"
+	    exit 1
+	fi
+    else
+	tmp_umount
+	echo "Error: mbr.bin not exist!"
+	exit 1
+    fi
+else
+    echo "OK, install SYSLINUX MBR by hands"
+fi
+
+#copy Acronis ISO and Puppy Slacko files
+echo
+echo -n "Search Acronis ISO(s)..."
+create_list "$CURDIR/acronis/" "*.iso"
+if [ -n "$FOUNDLST" ];then
+    echo "OK"
+    ask_list "$FOUNDLST" "Select Acronis ISO (Cancel - skip step): "
+	if [[ "$LIST_RET" != "Cancel" ]]; then
+	    ACRONIS=$LIST_RET
+	    echo -n "Creating directory $MNT_PATH/acronis..."
+	    mkdir -p "$MNT_PATH/acronis"
+	    if [ $? -ne 0 ]; then
+		echo "Error, skip this step"
+		ACRONIS=""
+	    else
+		echo "OK"
+		
+		SKIP_FLAG=0
+		if [ -e "$MNT_PATH/acronis/$ACRONIS" ];then
+		    ask_yn "File $ACRONIS already exist. Replace?"
+		    SKIP_FLAG=$?
+		fi
+		
+		if [ "$SKIP_FLAG" -eq 0 ]; then
+		    echo -n "Copy ISO file..."
+		    cp "$CURDIR/acronis/$ACRONIS" "$MNT_PATH/acronis/$ACRONIS"
+		    if [ $? -ne 0 ]; then
+			echo "Error, skip this step"
+			ACRONIS=""
+		    else
+			echo "OK"
+		    fi
+		fi 
+	    fi
+	else
+	    echo "OK, skip this step"
+	    ACRONIS=""
+	fi
+else
+    echo "not found, skip."
+    ACRONIS=""
+fi
+
+echo
+echo "Check Puppy Slacko files:"
+for FLE in vmlinuz initrd.gz puppy_slacko_*.sfs; do
+    echo -n "$FLE..."
+    check_file "$CURDIR/slacko" "$FLE" "-name"
+    if [ $? -ne 0 ]; then
+	echo "not found."
+	SLACKO_NF=1
+	break
+    else
+	SLACKO_NF=0
+	echo "OK"
+    fi
+done
+if [ "$SLACKO_NF" -eq 0 ]; then
+    ask_yn "Install Puppy Slacko files?"
+    if [ $? -eq 0 ];then
+	
+	SKIP_FLAG=0
+	
+	if [ -e "$MNT_PATH/slacko" ];then
+	    echo "'slacko' found at $MNT_PATH"
+	    ask_yn "Copy files anyway?"
+	    SKIP_FLAG=$?
+	fi
+	
+	if [ "$SKIP_FLAG" -eq 0 ]; then
+	    echo -n "Copy files..."
+	    cp -r "$CURDIR/slacko" "$MNT_PATH"
+	    if [ $? -eq 0 ]; then
+		SLACKO=1
+		echo "OK"
+	    else
+		SLACKO=0
+		echo "Error!"
+	    fi
+	else
+	    SLACKO=1
+	fi
+    else
+	SLACKO=0
+	echo "OK, skip install Puppy Slacko"
+    fi
+else
+    SLACKO=0
+    echo "Puppy Slacko files not found."
+fi
+
+#=================Create menu============================
+ask_yn "Create SYSLINUX menu (syslinux.cfg)?"
+if [ $? -ne 0 ]; then
+    echo
+    clear_tempfiles
+    echo "Umounting target drive if mounting temporary..."
+    tmp_umount
+    echo "Script complete!"
+    exit 0
+fi
+
+#---------------Find Windows-----------------------------
+ask_yn "Add installed Windows in boot menu?"
+if [ $? -eq 0 ];then
+    echo "Umount SYSLINUX volume (if mounted temporary)."
+    tmp_umount
+
+    echo "Search Windows loaders:"
+    BAK_IFS=IFS
+    IFS=$'\n'    
+    WINLIST=""
+    for DEVDATA in $(blkid); do
+	get_volinfo "$DEVDATA"
+	if [ -n "$VOLFS" ]; then
+	    if [[ "$VOLFS" == "ntfs" || "$VOLFS" == "vfat" ]];then #win fs
+		tmp_mount "$VOLNAME" "$VOLFS" "/tmp/winmnt"
+		if [ $? -ne 0 ]; then
+		    echo "$VOLNAME not mounted :("
+		    continue
+		fi
+		
+		#find loader
+		check_file "$MOUNTPOINT" "bootmgr" "-iname"
+		if [ $? -eq 0 ]; then #found bootmgr (vista/7/10)
+		    echo "$VOLNAME: found Windows Vista/7/10 loader"
+		    WINLIST="$WINLIST$VOLNAME,W\n"
+		else
+		    check_file "$MOUNTPOINT" "ntldr" "-iname"
+		    if [ $? -eq 0 ]; then #found ntldr (WINXP)
+			echo "$VOLNAME: found Windows XP loader"
+			WINLIST="$WINLIST$VOLNAME,X\n"
+		    else
+			echo "$VOLNAME: not found Windows loader"
+		    fi
+		fi
+		tmp_umount
+	    fi #FS
+	fi # -n $VOLFS
+    done
+    IFS=BAK_IFS
+    
+    
+else
+    echo "Ok, add installed Windows manually."
+fi
+#--------------------------------------------------------------
+while [ 1 -eq 1 ];do
+    ask_string_nsp "Enter default menu timeout (1=0.1 sec)" "1000"
+    
+    if (echo "$STR_RESULT" | grep -E -q '^?[0-9]+$'); then
+	break #Number
+    else
+	echo "Enter positive integer number!"
+    fi
+done
+DEF_TIMEOUT=$STR_RESULT
+
+echo 
+echo "===Mounting $INSTALL_VOL for creating menu...==="
+echo
+VOLDATA=`blkid "$INSTALL_VOL"`
+get_volinfo "$VOLDATA"
+tmp_mount "$INSTALL_VOL" "$VOLFS" "$MNT_PATH"
+if [ $? -ne 0 ]; then 
+    exit 1
+fi
+
+MENU_DIR="$MNT_PATH/$INSTALL_DIR"
+echo
+echo "Check main modules:"
+for FLE in menu.c32 chain.c32 memdisk; do
+    echo -n "$FLE..."
+    check_file "$MENU_DIR/modules" "$FLE" "-name"
+    if [ $? -ne 0 ]; then
+	echo "WARNING: not found!"
+    else
+	echo "OK"
+    fi
+done
+
+#backup old menu if exist
+if [ -f "$MENU_DIR/syslinux.cfg" ]; then
+    cp "$MENU_DIR/syslinux.cfg" "$MENU_DIR/syslinux.cfg.bak"
+fi
+#-------------------- Create menu file -----------------------
+echo "ui modules/menu.c32" >"$MENU_DIR/syslinux.cfg"
+echo "PROMPT 0" >>"$MENU_DIR/syslinux.cfg"
+echo >>"$MENU_DIR/syslinux.cfg"
+echo "menu title Local boot" >> "$MENU_DIR/syslinux.cfg"
+echo >>"$MENU_DIR/syslinux.cfg"
+
+#add_menuitem "$MENU_DIR/syslinux.cfg" "Second" "Second Item" "second.krnl" "initrd.gz" "append=1"
+
+#add Windows in menu
+echo
+echo -n "Add Windows (if exist) in menu..."
+BAK_IFS=IFS
+IFS=$'\n'
+WIN_CTR=0
+for WIN_ITEM in $(echo -e "$WINLIST");do
+    
+    WIN_VOL=`echo "$WIN_ITEM" |awk -F "," '{print $1}'`
+    WIN_TYPE=`echo "$WIN_ITEM"|awk -F "," '{print $2}'`
+    WIN_VOLNAME=`basename "$WIN_VOL"`
+    
+    #Get Syslinux ID
+    get_slid "$WIN_VOL"
+    
+    WIN_LABEL="windows$WIN_CTR"
+    if [[ "$WIN_TYPE"=="W" ]];then
+	WIN_MNULBL="Microsoft Windows (on $WIN_VOLNAME)"
+    else
+	WIN_MNULBL="Microsoft Windows XP (on $WIN_VOLNAME)"
+    fi
+    
+    add_menuitem "$MENU_DIR/syslinux.cfg" "$WIN_LABEL" "$WIN_MNULBL" "modules/chain.c32" "---" "$SL_ID"
+    let "WIN_CTR=WIN_CTR+1"
+done
+IFS=BAK_IFS
+echo "OK"
+
+#add Acronis in menu
+if [ -n "$ACRONIS" ]; then
+    echo -n "Add Acronis in menu..."
+    REL_PATH=`realpath --relative-to="$MENU_DIR" "$MNT_PATH/acronis"`
+    add_menuitem "$MENU_DIR/syslinux.cfg" "recovery" "System recovery" "modules/memdisk" "$REL_PATH/$ACRONIS" "iso raw"
+    echo "OK"
+fi
+
+#add Slacko in menu
+if [ "$SLACKO" -eq 1 ];then
+    echo -n "Add Slacko in menu..."
+    REL_PATH=`realpath --relative-to="$MENU_DIR" "$MNT_PATH/slacko"`
+    add_menuitem "$MENU_DIR/syslinux.cfg" "slacko" "Puppy Linux Slacko" "$REL_PATH/vmlinuz ro vga=normal" "$REL_PATH/initrd.gz" "---"
+    echo "OK"
+fi
+#====================End of create menu================================
+
+echo
+clear_tempfiles
+echo "Umounting target drive if mounting temporary..."
+tmp_umount
+echo "Script complete!"
